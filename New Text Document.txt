@@ -1,0 +1,99 @@
+import { WebSocketServer } from 'ws';
+import http from 'http';
+ 
+const PORT = process.env.PORT || 8080;
+ 
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('AR Orb Pop multiplayer relay is running.');
+});
+ 
+const wss = new WebSocketServer({ server });
+ 
+// rooms: Map<roomCode, { clients: Set<ws>, orbs: Map<orbId, {x,y,z,color,owner}>, scores: Map<clientId, score> }>
+const rooms = new Map();
+ 
+function getRoom(code) {
+  if (!rooms.has(code)) {
+    rooms.set(code, { clients: new Set(), orbs: new Map(), scores: new Map() });
+  }
+  return rooms.get(code);
+}
+ 
+function broadcast(room, data, exclude) {
+  const msg = JSON.stringify(data);
+  for (const client of room.clients) {
+    if (client !== exclude && client.readyState === client.OPEN) {
+      client.send(msg);
+    }
+  }
+}
+ 
+wss.on('connection', (ws) => {
+  let roomCode = null;
+  const clientId = Math.random().toString(36).slice(2, 9);
+ 
+  ws.on('message', (raw) => {
+    let msg;
+    try {
+      msg = JSON.parse(raw);
+    } catch {
+      return;
+    }
+ 
+    // --- join a room ---
+    if (msg.type === 'join') {
+      roomCode = msg.room;
+      const room = getRoom(roomCode);
+      room.clients.add(ws);
+      room.scores.set(clientId, 0);
+ 
+      // send current room state to the newly joined client
+      ws.send(JSON.stringify({
+        type: 'init',
+        clientId,
+        orbs: Array.from(room.orbs.entries()).map(([id, o]) => ({ id, ...o })),
+        scores: Object.fromEntries(room.scores),
+      }));
+ 
+      broadcast(room, { type: 'player-joined', clientId, playerCount: room.clients.size }, ws);
+      return;
+    }
+ 
+    if (!roomCode) return;
+    const room = getRoom(roomCode);
+ 
+    // --- orb placed ---
+    if (msg.type === 'place') {
+      room.orbs.set(msg.id, { x: msg.x, y: msg.y, z: msg.z, color: msg.color, owner: clientId });
+      broadcast(room, {
+        type: 'place', id: msg.id, x: msg.x, y: msg.y, z: msg.z, color: msg.color, owner: clientId,
+      }, ws);
+    }
+ 
+    // --- orb popped ---
+    if (msg.type === 'pop') {
+      if (room.orbs.has(msg.id)) {
+        room.orbs.delete(msg.id);
+        const current = room.scores.get(clientId) || 0;
+        room.scores.set(clientId, current + 10);
+        broadcast(room, {
+          type: 'pop', id: msg.id, popper: clientId, scores: Object.fromEntries(room.scores),
+        }, null); // send to everyone, including the popper, so score UI stays consistent
+      }
+    }
+  });
+ 
+  ws.on('close', () => {
+    if (!roomCode) return;
+    const room = getRoom(roomCode);
+    room.clients.delete(ws);
+    room.scores.delete(clientId);
+    broadcast(room, { type: 'player-left', clientId, playerCount: room.clients.size }, ws);
+    if (room.clients.size === 0) rooms.delete(roomCode);
+  });
+});
+ 
+server.listen(PORT, () => {
+  console.log(`AR Orb Pop relay listening on port ${PORT}`);
+});
